@@ -24,7 +24,29 @@ pub enum Dialog {
     Scan(ScanResults),
     StartMenu(StartMenuImport),
     Snippet(SnippetEditor),
+    Memos(MemoEditor),
 }
+
+/// 备忘录: the editor at the top (a new memo, or the one picked below) and the list.
+pub struct MemoEditor {
+    /// The memo being edited; `None` when writing a new one.
+    editing: Option<String>,
+    text: Entity<TextInput>,
+    /// A time in words ("周五下午3点").
+    when: Entity<TextInput>,
+    remind: Option<u64>,
+    /// Which quick choice is lit; `None` when the time was typed or came with the memo.
+    preset: Option<usize>,
+    repeat: crate::memo::Repeat,
+    when_error: bool,
+    show_done: bool,
+    error: Option<SharedString>,
+    focus: FocusHandle,
+    _subscription: Subscription,
+}
+
+/// Quick reminder choices.
+const MEMO_PRESETS: [&str; 5] = ["不提醒", "10 分钟后", "1 小时后", "今晚 20:00", "明早 9:00"];
 
 /// 文本片段: name and text (several lines).
 pub struct SnippetEditor {
@@ -197,6 +219,7 @@ impl Dialog {
             Dialog::Scan(_) => Vec::new(),
             Dialog::StartMenu(s) => vec![s.query.clone(), s.category.clone()],
             Dialog::Snippet(s) => vec![s.name.clone(), s.text.clone()],
+            Dialog::Memos(m) => vec![m.text.clone(), m.when.clone()],
         }
     }
 
@@ -208,6 +231,7 @@ impl Dialog {
             Dialog::Scan(s) => &s.focus,
             Dialog::StartMenu(s) => &s.focus,
             Dialog::Snippet(s) => &s.focus,
+            Dialog::Memos(m) => &m.focus,
         }
     }
 }
@@ -372,6 +396,404 @@ impl Launcher {
             .text_size(px(13.5))
             .line_height(px(20.))
             .child(input.clone())
+    }
+
+    /// Open 备忘录, with `id` (if any) in the editor.
+    pub fn open_memos(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.restore_full(cx);
+        self.show(window, cx);
+        let text = cx.new(|cx| TextInput::new("要记的事，可以有多行", cx).multiline());
+        let when = new_input(cx, "或者写：周五下午3点、10分钟后", "");
+        let subscription = cx.subscribe(&when, |this, input, _: &InputEvent, cx| {
+            let typed = input.read(cx).committed_text();
+            let Some(Dialog::Memos(editor)) = this.dialog.as_mut() else { return };
+            if typed.trim().is_empty() {
+                editor.when_error = false;
+                return;
+            }
+            match crate::memo::parse_when(&typed, &crate::memo::local_now()).and_then(|(w, _)| crate::memo::resolve(w)) {
+                Some(at) => {
+                    editor.remind = Some(at);
+                    editor.preset = None;
+                    editor.when_error = false;
+                }
+                None => editor.when_error = true,
+            }
+            cx.notify();
+        });
+        let focus = text.focus_handle(cx);
+        self.dialog = Some(Dialog::Memos(MemoEditor {
+            editing: None,
+            text,
+            when,
+            remind: None,
+            preset: Some(0),
+            repeat: crate::memo::Repeat::None,
+            when_error: false,
+            show_done: false,
+            error: None,
+            focus: cx.focus_handle(),
+            _subscription: subscription,
+        }));
+        if let Some(id) = id {
+            self.edit_memo(&id, cx);
+        }
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    /// Put memo `id` in the editor.
+    fn edit_memo(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(memo) = self.memos.iter().find(|m| m.id == id).cloned() else { return };
+        let Some(Dialog::Memos(editor)) = self.dialog.as_mut() else { return };
+        editor.editing = Some(memo.id.clone());
+        editor.remind = memo.next_time().or(memo.remind_at.filter(|_| !memo.fired));
+        editor.preset = if editor.remind.is_none() { Some(0) } else { None };
+        editor.repeat = memo.repeat;
+        editor.error = None;
+        editor.when_error = false;
+        if memo.done {
+            editor.show_done = true;
+        }
+        let (text, when) = (editor.text.clone(), editor.when.clone());
+        text.update(cx, |input, cx| input.set_text(memo.text.clone(), cx));
+        when.update(cx, |input, cx| input.set_text("", cx));
+        cx.notify();
+    }
+
+    /// Back to writing a new memo.
+    fn reset_memo_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(Dialog::Memos(editor)) = self.dialog.as_mut() else { return };
+        editor.editing = None;
+        editor.remind = None;
+        editor.preset = Some(0);
+        editor.repeat = crate::memo::Repeat::None;
+        editor.error = None;
+        editor.when_error = false;
+        let (text, when) = (editor.text.clone(), editor.when.clone());
+        text.update(cx, |input, cx| input.set_text("", cx));
+        when.update(cx, |input, cx| input.set_text("", cx));
+        cx.notify();
+    }
+
+    fn save_memo(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Dialog::Memos(editor)) = self.dialog.as_mut() else { return };
+        let text = editor.text.read(cx).committed_text().trim().to_string();
+        if text.is_empty() {
+            editor.error = Some("先写点内容".into());
+            cx.notify();
+            return;
+        }
+        let (editing, remind, repeat) = (editor.editing.clone(), editor.remind, editor.repeat);
+        let repeat = if remind.is_some() { repeat } else { crate::memo::Repeat::None };
+        let now = crate::config::now_secs();
+        match editing.and_then(|id| self.memos.iter_mut().find(|m| m.id == id)) {
+            Some(memo) => {
+                if memo.remind_at != remind || memo.repeat != repeat {
+                    memo.fired = false;
+                    memo.snoozed = None;
+                }
+                memo.text = text;
+                memo.remind_at = remind;
+                memo.repeat = repeat;
+                memo.updated = now;
+                self.save_memos();
+            }
+            None => {
+                self.add_memo(text, remind, repeat);
+            }
+        }
+        let message = match remind {
+            Some(at) => format!("已保存，{}提醒", crate::memo::when_label(at, now)),
+            None => "已保存".to_string(),
+        };
+        self.reset_memo_editor(cx);
+        self.show_toast(message, false, cx);
+    }
+
+    fn render_memos(&self, editor: &MemoEditor, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> (AnyElement, AnyElement) {
+        let now = crate::config::now_secs();
+        let chip = |id: (&'static str, usize), label: String, selected: bool| {
+            div()
+                .id(id)
+                .h(px(28.))
+                .px(px(11.))
+                .rounded_full()
+                .border_1()
+                .flex()
+                .items_center()
+                .text_size(px(12.5))
+                .cursor_pointer()
+                .when(selected, |d| d.bg(theme.accent_soft).border_color(theme.accent).text_color(theme.accent))
+                .when(!selected, |d| d.border_color(theme.border).text_color(theme.text_muted).hover(|s| s.bg(theme.row_hover)))
+                .child(label)
+        };
+        let presets = MEMO_PRESETS.iter().enumerate().map(|(ix, label)| {
+            chip(("memo-preset", ix), label.to_string(), editor.preset == Some(ix)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                let at = match ix {
+                    0 => None,
+                    1 => Some(crate::config::now_secs() + 600),
+                    2 => Some(crate::config::now_secs() + 3600),
+                    _ => {
+                        let words = if ix == 3 { "今晚" } else { "明早" };
+                        crate::memo::parse_when(words, &crate::memo::local_now()).and_then(|(w, _)| crate::memo::resolve(w))
+                    }
+                };
+                let Some(Dialog::Memos(editor)) = this.dialog.as_mut() else { return };
+                editor.remind = at;
+                editor.preset = Some(ix);
+                editor.when_error = false;
+                let when = editor.when.clone();
+                when.update(cx, |input, cx| input.set_text("", cx));
+                cx.notify();
+            }))
+        }).collect::<Vec<_>>();
+        let repeats = crate::memo::Repeat::ALL.into_iter().enumerate().map(|(ix, r)| {
+            chip(("memo-repeat", ix), r.label().to_string(), editor.repeat == r).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if let Some(Dialog::Memos(editor)) = this.dialog.as_mut() {
+                    editor.repeat = r;
+                }
+                cx.notify();
+            }))
+        }).collect::<Vec<_>>();
+        let preview = if editor.when_error {
+            div().text_size(px(12.)).text_color(theme.danger).child("看不懂这个时间，试试“明天下午3点”“10分钟后”“周五 9:30”")
+        } else {
+            match editor.remind {
+                Some(at) => div().text_size(px(12.)).text_color(theme.accent).child(format!("将在 {} 提醒", crate::memo::when_label(at, now))),
+                None => div().text_size(px(12.)).text_color(theme.text_faint).child("不提醒，只记下来"),
+            }
+        };
+
+        let done_count = self.memos.iter().filter(|m| m.done).count();
+        let rows = self.memos.iter().filter(|m| editor.show_done || !m.done).enumerate().map(|(ix, memo)| {
+            let editing = editor.editing.as_deref() == Some(memo.id.as_str());
+            let (open_id, done_id, pin_id, remove_id) = (memo.id.clone(), memo.id.clone(), memo.id.clone(), memo.id.clone());
+            let more: String = memo.text.lines().skip(1).map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(60).collect();
+            let reminder = match memo.next_time() {
+                Some(at) => {
+                    let mut label = crate::memo::when_label(at, now);
+                    if memo.repeat != crate::memo::Repeat::None {
+                        label.push_str(&format!(" · {}", memo.repeat.label()));
+                    }
+                    Some((label, at <= now))
+                }
+                None => None,
+            };
+            let small_button = |id: (&'static str, usize), icon_name: &'static str, color: gpui::Hsla| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .size(px(26.))
+                    .rounded(px(7.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|s| s.bg(theme.row_hover))
+                    .child(icon(icon_name, 14., color))
+            };
+            div()
+                .id(("memo", ix))
+                .group("memo-row")
+                .min_h(px(48.))
+                .px(px(8.))
+                .py(px(6.))
+                .rounded(px(9.))
+                .border_1()
+                .border_color(if editing { theme.accent } else { gpui::transparent_black() })
+                .when(editing, |d| d.bg(theme.accent_soft))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.row_hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.edit_memo(&open_id, cx)))
+                .child(
+                    small_button(("memo-done", ix), if memo.done { "circle-check" } else { "circle-empty" }, if memo.done { theme.accent } else { theme.text_faint })
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(m) = this.memos.iter_mut().find(|m| m.id == done_id) {
+                                    m.done = !m.done;
+                                    m.snoozed = None;
+                                    m.updated = crate::config::now_secs();
+                                }
+                                this.save_memos();
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.5))
+                                .truncate()
+                                .when(memo.done, |d| d.text_color(theme.text_faint).line_through())
+                                .when(memo.pinned, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                .child(memo.title()),
+                        )
+                        .when(!more.is_empty(), |d| d.child(div().text_size(px(12.)).text_color(theme.text_faint).truncate().child(more)))
+                        .when_some(reminder, |d, (label, overdue)| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_size(px(11.5))
+                                    .text_color(if overdue { theme.danger } else { theme.accent })
+                                    .child(icon("bell", 11., if overdue { theme.danger } else { theme.accent }))
+                                    .child(label),
+                            )
+                        }),
+                )
+                .child(
+                    small_button(("memo-pin", ix), "pin", if memo.pinned { theme.accent } else { theme.text_faint })
+                        .when(!memo.pinned, |d| d.opacity(0.).group_hover("memo-row", |s| s.opacity(1.)))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(m) = this.memos.iter_mut().find(|m| m.id == pin_id) {
+                                    m.pinned = !m.pinned;
+                                }
+                                this.save_memos();
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    small_button(("memo-remove", ix), "trash", theme.text_faint)
+                        .opacity(0.)
+                        .group_hover("memo-row", |s| s.opacity(1.))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.memos.retain(|m| m.id != remove_id);
+                                this.save_memos();
+                                let editing = matches!(&this.dialog, Some(Dialog::Memos(e)) if e.editing.as_deref() == Some(remove_id.as_str()));
+                                if editing {
+                                    this.reset_memo_editor(cx);
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                )
+        }).collect::<Vec<_>>();
+        let open_count = self.memos.iter().filter(|m| !m.done).count();
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(label(if editor.editing.is_some() { "编辑备忘录" } else { "新的备忘录" }, theme))
+                    .child(div().flex_1())
+                    .when(editor.editing.is_some(), |d| {
+                        d.child(
+                            div()
+                                .id("memo-new")
+                                .text_size(px(12.5))
+                                .text_color(theme.accent)
+                                .cursor_pointer()
+                                .child("+ 写新的")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.reset_memo_editor(cx))),
+                        )
+                    }),
+            )
+            .child(self.area_box(&editor.text, theme, window, cx).min_h(px(84.)))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().text_size(px(12.5)).text_color(theme.text_muted).mr(px(4.)).child("提醒"))
+                    .children(presets),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(self.input_box(&editor.when, theme, window, cx).w(px(250.)))
+                    .child(div().flex_1().min_w_0().child(preview)),
+            )
+            .when(editor.remind.is_some(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(div().text_size(px(12.5)).text_color(theme.text_muted).mr(px(4.)).child("重复"))
+                        .children(repeats),
+                )
+            })
+            .when_some(editor.error.clone(), |d, err| d.child(div().text_size(px(12.5)).text_color(theme.danger).child(err)))
+            .child(div().h(px(1.)).bg(theme.border).my(px(4.)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(label("全部备忘", theme))
+                    .child(div().ml(px(6.)).text_size(px(12.)).text_color(theme.text_faint).child(format!("{open_count} 条未完成")))
+                    .child(div().flex_1())
+                    .when(done_count > 0, |d| {
+                        d.child(
+                            div()
+                                .id("memo-show-done")
+                                .text_size(px(12.5))
+                                .text_color(theme.accent)
+                                .cursor_pointer()
+                                .child(if editor.show_done { format!("隐藏已完成（{done_count}）") } else { format!("显示已完成（{done_count}）") })
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    if let Some(Dialog::Memos(editor)) = this.dialog.as_mut() {
+                                        editor.show_done = !editor.show_done;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .when(open_count == 0 && !editor.show_done, |d| {
+                d.child(
+                    div()
+                        .py(px(14.))
+                        .text_size(px(12.5))
+                        .text_color(theme.text_faint)
+                        .child("还没有备忘。也可以在搜索框输入“tx 明天9点 开会”直接添加。"),
+                )
+            })
+            .child(div().flex().flex_col().gap(px(2.)).children(rows))
+            .into_any_element();
+
+        let footer = div()
+            .flex_none()
+            .px(px(22.))
+            .py(px(16.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(div().text_size(px(12.)).text_color(theme.text_faint).child("搜索框输入 tx / bw 也能添加和查看"))
+            .child(div().flex_1())
+            .child(button("memo-close", "关闭", false, theme).on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.close_dialog(window, cx))))
+            .child(
+                button("memo-save", if editor.editing.is_some() { "保存修改" } else { "添加" }, true, theme)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save_memo(window, cx))),
+            )
+            .into_any_element();
+        (body, footer)
     }
 
     /// Add (`id` none) or edit a 文本片段; `text` fills in the content of a new one.
@@ -845,6 +1267,7 @@ impl Launcher {
             Some(Dialog::Scan(_)) => self.close_dialog(window, cx),
             Some(Dialog::StartMenu(_)) => self.import_start_menu(false, window, cx),
             Some(Dialog::Snippet(_)) => self.save_snippet(window, cx),
+            Some(Dialog::Memos(_)) => self.save_memo(window, cx),
             None => {}
         }
     }
@@ -1216,7 +1639,9 @@ impl Launcher {
                 let visual = Self::tool_visual(&draft);
                 Some(self.tile(&visual, 56., 28., theme, cx))
             }
-            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) | Dialog::StartMenu(_) | Dialog::Snippet(_) => None,
+            Dialog::Settings(_) | Dialog::Category(_) | Dialog::Scan(_) | Dialog::StartMenu(_) | Dialog::Snippet(_) | Dialog::Memos(_) => {
+                None
+            }
         };
         let dialog = self.dialog.as_ref()?;
         let focus = dialog.focus_handle().clone();
@@ -1245,6 +1670,10 @@ impl Launcher {
                 self.render_settings_form(editor, theme, window, cx),
                 self.render_settings_footer(theme, cx),
             ),
+            Dialog::Memos(editor) => {
+                let (body, footer) = self.render_memos(editor, theme, window, cx);
+                ("备忘录", body, footer)
+            }
             Dialog::Snippet(editor) => (
                 if editor.id.is_some() { "编辑文本片段" } else { "新建文本片段" },
                 div()
@@ -1326,7 +1755,11 @@ impl Launcher {
                     .into_any_element(),
             ),
         };
-        let dialog_width = if matches!(dialog, Dialog::Category(_)) { 400. } else if matches!(dialog, Dialog::StartMenu(_)) { 640. } else { 560. };
+        let dialog_width = match dialog {
+            Dialog::Category(_) => 400.,
+            Dialog::StartMenu(_) | Dialog::Memos(_) => 640.,
+            _ => 560.,
+        };
 
         let card_bg = if theme.dark { gpui::rgb(0x29232a) } else { gpui::rgb(0xfffbfc) };
         Some(
@@ -2633,6 +3066,26 @@ impl Launcher {
                     }),
                 ),
             )
+            .child(section("备忘录"))
+            .child(
+                toggle("memo-enabled", "启用备忘录", "Ctrl+M 打开；搜索框输入“tx 明天9点 开会”直接添加，到时在右下角提醒", settings.memo_enabled, theme)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.config.settings.memo_enabled = !this.config.settings.memo_enabled;
+                        this.config.save();
+                        cx.notify();
+                    })),
+            )
+            .when(settings.memo_enabled, |d| {
+                d.child(
+                    toggle("memo-sound", "提醒时播放提示音", "用系统的通知声音", settings.memo_sound, theme).on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| {
+                            this.config.settings.memo_sound = !this.config.settings.memo_sound;
+                            this.config.save();
+                            cx.notify();
+                        },
+                    )),
+                )
+            })
             .child(section("终端"))
             .child(
                 div()

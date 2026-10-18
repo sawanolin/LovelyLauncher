@@ -321,6 +321,52 @@ pub fn place_corner_popup(raw: isize, size: f32, margin: f32, at_cursor: bool) {
     }
 }
 
+/// Put a `width` × `height` (logical px) popup in the bottom-right corner of the
+/// primary monitor's work area, above everything, without activating it.
+pub fn place_corner_rect(raw: isize, width: f32, height: f32, margin: f32) {
+    use windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
+    remove_window_frame(raw);
+    let h = hwnd(raw);
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let scale = dpi_x.max(96) as f32 / 96.;
+        let (w, ht, gap) = ((width * scale) as i32, (height * scale) as i32, (margin * scale) as i32);
+        let work = info.rcWork;
+        let _ = SetWindowPos(h, Some(HWND_TOPMOST), work.right - w - gap, work.bottom - ht - gap, w, ht, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+/// The system's notification sound, without waiting for it.
+pub fn notify_sound() {
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
+    unsafe {
+        let _ = PlaySoundW(windows::core::w!("SystemNotification"), None, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+    }
+}
+
+/// Local date and time → unix seconds (daylight saving included).
+pub fn local_to_unix(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> Option<u64> {
+    use windows::Win32::{
+        Foundation::{FILETIME, SYSTEMTIME},
+        System::Time::{SystemTimeToFileTime, TzSpecificLocalTimeToSystemTime},
+    };
+    let local = SYSTEMTIME { wYear: y as u16, wMonth: mo as u16, wDay: d as u16, wHour: h as u16, wMinute: mi as u16, ..Default::default() };
+    let mut utc = SYSTEMTIME::default();
+    let mut file = FILETIME::default();
+    unsafe {
+        TzSpecificLocalTimeToSystemTime(None, &local, &mut utc).ok()?;
+        SystemTimeToFileTime(&utc, &mut file).ok()?;
+    }
+    let ticks = ((file.dwHighDateTime as u64) << 32) | file.dwLowDateTime as u64;
+    (ticks / 10_000_000).checked_sub(11_644_473_600)
+}
+
 /// Is a full-screen program in front: a game, a full-screen video, a presentation?
 pub fn fullscreen_app_in_front() -> bool {
     use windows::Win32::UI::{

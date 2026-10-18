@@ -166,6 +166,10 @@ pub struct Settings {
     pub clipboard_hotkey: String,
     /// 文本片段 show up in search and in 剪贴板历史.
     pub snippets_enabled: bool,
+    /// 备忘录 and its reminders.
+    pub memo_enabled: bool,
+    /// Play the system notification sound with a reminder.
+    pub memo_sound: bool,
     /// How bouncy the ring is: 0 off, 1 gentle, 2 standard, 3 wild.
     pub ring_bounce: u8,
     /// How big the ring is: 0 small, 1 standard, 2 large, 3 extra large.
@@ -338,6 +342,8 @@ impl Default for Settings {
             clipboard_history: true,
             clipboard_hotkey: "Alt+Shift+V".into(),
             snippets_enabled: true,
+            memo_enabled: true,
+            memo_sound: true,
             ring_bounce: 2,
             ring_size: 1,
             ring_at_cursor: false,

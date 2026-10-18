@@ -42,6 +42,7 @@ actions!(
         PickColor,
         MeasureScreen,
         ClipboardHistory,
+        OpenMemos,
         OpenSettings,
         AddTool,
         FocusNextField,
@@ -67,6 +68,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-c", PickColor, launcher),
         KeyBinding::new("ctrl-shift-r", MeasureScreen, launcher),
         KeyBinding::new("ctrl-shift-v", ClipboardHistory, launcher),
+        KeyBinding::new("ctrl-m", OpenMemos, launcher),
         KeyBinding::new("ctrl-,", OpenSettings, launcher),
         KeyBinding::new("ctrl-d", AddTool, launcher),
         KeyBinding::new("tab", FocusNextField, dialog),
@@ -86,10 +88,12 @@ pub enum QuickAction {
     ColorPicker,
     Ruler,
     Clipboard,
+    Memo,
 }
 
 impl QuickAction {
-    pub const ALL: [QuickAction; 8] = [
+    pub const ALL: [QuickAction; 9] = [
+        QuickAction::Memo,
         QuickAction::Clipboard,
         QuickAction::NewTerminal,
         QuickAction::OpenProject,
@@ -110,6 +114,7 @@ impl QuickAction {
             QuickAction::ColorPicker => "取色器",
             QuickAction::Ruler => "屏幕标尺",
             QuickAction::Clipboard => "剪贴板历史",
+            QuickAction::Memo => "备忘录",
         }
     }
 
@@ -123,6 +128,7 @@ impl QuickAction {
             QuickAction::ColorPicker => "pipette",
             QuickAction::Ruler => "ruler",
             QuickAction::Clipboard => "clipboard",
+            QuickAction::Memo => "sticky-note",
         }
     }
 
@@ -136,6 +142,7 @@ impl QuickAction {
             QuickAction::ColorPicker => &["Ctrl", "Shift", "C"],
             QuickAction::Ruler => &["Ctrl", "Shift", "R"],
             QuickAction::Clipboard => &["Ctrl", "Shift", "V"],
+            QuickAction::Memo => &["Ctrl", "M"],
         }
     }
 
@@ -149,6 +156,7 @@ impl QuickAction {
             QuickAction::ColorPicker => "action:color",
             QuickAction::Ruler => "action:ruler",
             QuickAction::Clipboard => "action:clipboard",
+            QuickAction::Memo => "action:memo",
         }
     }
 
@@ -236,6 +244,26 @@ impl TextAction {
         let openable = looks_like_url(text) || (text.len() < 400 && Path::new(text.trim().trim_matches('"')).exists());
         Self::ALL.into_iter().filter(|a| *a != TextAction::Open || openable).collect()
     }
+}
+
+/// `bw …`, `tx …`, `备忘 …`, `提醒 …`, `memo …` or `提醒我…`: the text for 备忘录.
+fn memo_query(query: &str) -> Option<&str> {
+    let query = query.trim_start();
+    if query.starts_with("提醒我") {
+        return Some(query);
+    }
+    for prefix in ["bw", "tx", "memo", "备忘", "提醒"] {
+        let Some(head) = query.get(..prefix.len()) else { continue };
+        if !head.eq_ignore_ascii_case(prefix) {
+            continue;
+        }
+        match &query[prefix.len()..] {
+            "" => return Some(""),
+            tail if tail.starts_with(' ') => return Some(tail.trim()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `cb` or `cb …` in the search box: what to filter 剪贴板历史 by.
@@ -351,6 +379,10 @@ pub enum Target {
     Clip(String),
     /// A 文本片段 (by id): pasted.
     Snippet(String),
+    /// Add a 备忘录 from what follows `bw` / `tx` (a time first, if any).
+    NewMemo(String),
+    /// A 备忘录 (by id): opened in 备忘录.
+    Memo(String),
 }
 
 impl Target {
@@ -553,6 +585,15 @@ pub struct Launcher {
     ring_text: Option<String>,
     /// Text copied lately: holding Alt soon after brings up the text ring for it.
     last_text_copy: Option<(std::time::Instant, String)>,
+    /// 备忘录.
+    pub(crate) memos: Vec<crate::memo::Memo>,
+    reminder_popup: Option<gpui::WindowHandle<crate::reminder::ReminderPopup>>,
+    /// Memos whose reminders are showing, then waiting to show; with the time each was due.
+    reminder_queue: Vec<(String, u64)>,
+    /// Due before the launcher started.
+    late_reminders: std::collections::HashSet<String>,
+    /// To open in 备忘录 (from a reminder card).
+    memo_to_open: Option<String>,
     pub(crate) update: UpdateState,
     pub(crate) preview: Option<gpui::WindowHandle<crate::preview::Preview>>,
     /// The Alt ring popup, created on first use and then kept (hidden) for reuse.
@@ -675,6 +716,11 @@ impl Launcher {
             prev_foreground: None,
             ring_text: None,
             last_text_copy: None,
+            memos: crate::memo::load(),
+            reminder_popup: None,
+            reminder_queue: Vec::new(),
+            late_reminders: Default::default(),
+            memo_to_open: None,
             update: UpdateState::default(),
             preview: None,
             ring: None,
@@ -723,6 +769,7 @@ impl Launcher {
         }
         this.scan_apps(cx);
         this.listen_to_clipboard(cx);
+        this.watch_reminders(cx);
         this.schedule_update_check(cx);
         this.reload_wallpaper(window, cx);
         this
@@ -954,6 +1001,10 @@ impl Launcher {
                 self.activate(Target::Action(action), false, window, cx)
             }
             AppEvent::TextAction(action) => self.run_text_action(action, window, cx),
+            AppEvent::OpenMemos => {
+                let id = self.memo_to_open.take();
+                self.open_memos(id, window, cx);
+            }
             AppEvent::ClipboardHotkey => {
                 self.remember_foreground();
                 self.open_clipboard_history(window, cx);
@@ -1177,6 +1228,13 @@ impl Launcher {
             return;
         }
 
+        // `bw …` / `tx …` / `提醒我…`: 备忘录, or a new one.
+        if self.config.settings.memo_enabled
+            && let Some(input) = memo_query(raw)
+        {
+            self.results = self.memo_results(input);
+            return;
+        }
         // `cb …`: 剪贴板历史 and 文本片段.
         if let Some(filter) = clipboard_filter(raw) {
             self.results = self.clipboard_results(&filter.to_lowercase());
@@ -1412,6 +1470,238 @@ impl Launcher {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 备忘录
+
+    pub fn save_memos(&mut self) {
+        crate::memo::sort(&mut self.memos);
+        crate::memo::save(&self.memos);
+    }
+
+    /// Add a memo; returns its id.
+    pub fn add_memo(&mut self, text: String, remind_at: Option<u64>, repeat: crate::memo::Repeat) -> String {
+        let now = now_secs();
+        let id = crate::config::new_id();
+        self.memos.push(crate::memo::Memo {
+            id: id.clone(),
+            text,
+            created: now,
+            updated: now,
+            remind_at,
+            repeat,
+            ..Default::default()
+        });
+        self.save_memos();
+        id
+    }
+
+    /// `bw 明天9点 开会`: add it, then show the list (with it in) instead of hiding.
+    fn add_memo_from_search(&mut self, input: &str, cx: &mut Context<Self>) {
+        let parsed = crate::memo::parse_when(input, &crate::memo::local_now());
+        let (remind_at, text) = match parsed {
+            Some((when, rest)) => (crate::memo::resolve(when), rest),
+            None => (None, input.trim().to_string()),
+        };
+        if text.is_empty() {
+            self.show_toast("先写上要记的事，比如：tx 明天9点 开会", true, cx);
+            return;
+        }
+        let message = match remind_at {
+            Some(at) => format!("已添加提醒：{} · {}", text, crate::memo::when_label(at, now_secs())),
+            None => format!("已添加到备忘录：{text}"),
+        };
+        self.add_memo(text, remind_at, crate::memo::Repeat::None);
+        self.search.update(cx, |input, cx| input.set_text("bw ", cx));
+        self.show_toast(message, false, cx);
+        cx.notify();
+    }
+
+    fn memo_results(&self, input: &str) -> Vec<ResultItem> {
+        let now = now_secs();
+        let mut items = Vec::new();
+        if !input.is_empty() {
+            let parsed = crate::memo::parse_when(input, &crate::memo::local_now());
+            let (when, text) = match &parsed {
+                Some((when, rest)) => (crate::memo::resolve(*when), rest.clone()),
+                None => (None, input.to_string()),
+            };
+            let title = if text.is_empty() { "添加备忘录：（在时间后面写上要做的事）".to_string() } else { format!("添加备忘录：{text}") };
+            let subtitle = match when {
+                Some(at) => format!("提醒：{} · Enter 保存", crate::memo::when_label(at, now)),
+                None => "不提醒 · Enter 保存（开头写上“明天9点”“10分钟后”就会到时提醒）".to_string(),
+            };
+            items.push(ResultItem {
+                target: Target::NewMemo(input.to_string()),
+                title: title.into(),
+                subtitle: subtitle.into(),
+                badge: "新建",
+                visual: Visual::Glyph { icon: if when.is_some() { "bell" } else { "sticky-note" }, tint: "orange".into() },
+                score: 0,
+            });
+        } else {
+            items.push(ResultItem {
+                target: Target::Action(QuickAction::Memo),
+                title: "打开备忘录".into(),
+                subtitle: "Ctrl+M · 在 bw 后面写内容可以直接添加，写上时间就会提醒".into(),
+                badge: "操作",
+                visual: Visual::Glyph { icon: "sticky-note", tint: "orange".into() },
+                score: 0,
+            });
+        }
+        let shown = self.memos.iter().filter(|m| if input.is_empty() { !m.done } else { m.matches(input) }).take(40);
+        for memo in shown {
+            let mut subtitle = match memo.next_time() {
+                Some(at) => format!("提醒：{}", crate::memo::when_label(at, now)),
+                None if memo.remind_at.is_some() => "已提醒".to_string(),
+                None => "无提醒".to_string(),
+            };
+            if memo.repeat != crate::memo::Repeat::None && !memo.done {
+                subtitle.push_str(&format!(" · {}", memo.repeat.label()));
+            }
+            items.push(ResultItem {
+                target: Target::Memo(memo.id.clone()),
+                title: memo.title().into(),
+                subtitle: subtitle.into(),
+                badge: if memo.done { "已完成" } else { "备忘录" },
+                visual: Visual::Glyph { icon: if memo.done { "circle-check" } else { "sticky-note" }, tint: if memo.done { "slate".into() } else { "orange".into() } },
+                score: 0,
+            });
+        }
+        items
+    }
+
+    /// Check for due reminders now, then every 10 seconds.
+    fn watch_reminders(&mut self, cx: &mut Context<Self>) {
+        let now = now_secs();
+        self.late_reminders = self.memos.iter().filter(|m| m.due(now)).map(|m| m.id.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            // Give the desktop a moment after starting with Windows.
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            loop {
+                if this.update(cx, |this, cx| this.check_reminders(cx)).is_err() {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(10)).await;
+            }
+        })
+        .detach();
+    }
+
+    fn check_reminders(&mut self, cx: &mut Context<Self>) {
+        if !self.config.settings.memo_enabled {
+            return;
+        }
+        let now = now_secs();
+        let mut fired = false;
+        for memo in self.memos.iter_mut().filter(|m| m.due(now)) {
+            let due_at = memo.next_time().unwrap_or(now);
+            memo.fire(now, crate::memo::local_weekday);
+            if !self.reminder_queue.iter().any(|(id, _)| *id == memo.id) {
+                self.reminder_queue.push((memo.id.clone(), due_at));
+            }
+            fired = true;
+        }
+        if fired {
+            self.save_memos();
+            if self.config.settings.memo_sound {
+                win::notify_sound();
+            }
+            self.show_next_reminder(cx);
+            cx.notify();
+        }
+    }
+
+    /// Show the first waiting reminder in the card, or put the card away.
+    fn show_next_reminder(&mut self, cx: &mut Context<Self>) {
+        let memos = &self.memos;
+        self.reminder_queue.retain(|(id, _)| memos.iter().any(|m| m.id == *id && !m.done));
+        let Some((id, due_at)) = self.reminder_queue.first().cloned() else {
+            if let Some(popup) = self.reminder_popup {
+                popup.update(cx, |popup, _, cx| popup.hide(cx)).ok();
+            }
+            return;
+        };
+        let Some(memo) = self.memos.iter().find(|m| m.id == id) else { return };
+        let mut when = crate::memo::when_label(due_at, now_secs());
+        if memo.repeat != crate::memo::Repeat::None {
+            when.push_str(&format!(" · {}", memo.repeat.label()));
+        }
+        let card = crate::reminder::Card { id: id.clone(), text: memo.text.clone(), when, late: self.late_reminders.contains(&id) };
+        let more = self.reminder_queue.len() - 1;
+        if let Some(popup) = self.reminder_popup {
+            if popup.update(cx, |popup, _, cx| popup.show(card.clone(), more, cx)).is_ok() {
+                return;
+            }
+            self.reminder_popup = None;
+        }
+        let launcher = cx.weak_entity();
+        let options = gpui::WindowOptions {
+            window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                gpui::point(gpui::px(-10000.), gpui::px(-10000.)),
+                gpui::size(gpui::px(crate::reminder::WIDTH), gpui::px(crate::reminder::HEIGHT)),
+            ))),
+            titlebar: None,
+            kind: gpui::WindowKind::PopUp,
+            window_background: gpui::WindowBackgroundAppearance::Transparent,
+            show: false,
+            focus: false,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            app_id: Some("LovelyLauncher".into()),
+            ..Default::default()
+        };
+        match cx.open_window(options, move |window, cx| cx.new(|_| crate::reminder::ReminderPopup::new(launcher, window))) {
+            Ok(handle) => {
+                self.reminder_popup = Some(handle);
+                handle.update(cx, |popup, _, cx| popup.show(card, more, cx)).ok();
+            }
+            Err(err) => self.show_toast(format!("无法显示提醒：{err}"), true, cx),
+        }
+    }
+
+    fn reminder_handled(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.reminder_queue.retain(|(i, _)| i != id);
+        self.late_reminders.remove(id);
+        // Called from the card's own click: update it once that is over.
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| this.show_next_reminder(cx)).ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 完成, from the reminder card.
+    pub fn finish_memo(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(memo) = self.memos.iter_mut().find(|m| m.id == id) {
+            memo.done = true;
+            memo.snoozed = None;
+            memo.updated = now_secs();
+        }
+        self.save_memos();
+        self.reminder_handled(id, cx);
+    }
+
+    /// 稍后提醒: once more in `secs`.
+    pub fn snooze_memo(&mut self, id: &str, secs: u64, cx: &mut Context<Self>) {
+        if let Some(memo) = self.memos.iter_mut().find(|m| m.id == id) {
+            memo.snoozed = Some(now_secs() + secs);
+        }
+        self.save_memos();
+        self.reminder_handled(id, cx);
+    }
+
+    pub fn dismiss_reminder(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.reminder_handled(id, cx);
+    }
+
+    pub fn open_memo_from_reminder(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.memo_to_open = Some(id.to_string());
+        self.reminder_handled(id, cx);
+        // Opening needs the launcher's own window.
+        let _ = cx.global::<crate::system::AppEvents>().0.unbounded_send(AppEvent::OpenMemos);
     }
 
     /// Remember the window in front (not ours) so a paste can go back to it.
@@ -1700,6 +1990,7 @@ impl Launcher {
         match action {
             QuickAction::ColorPicker => settings.color_picker,
             QuickAction::Ruler => settings.ruler,
+            QuickAction::Memo => settings.memo_enabled,
             _ => true,
         }
     }
@@ -2461,6 +2752,7 @@ impl Launcher {
         if !self.config.settings.everything
             || self.ai_request().is_some()
             || clipboard_filter(&query).is_some()
+            || (self.config.settings.memo_enabled && memo_query(&query).is_some())
             || query.chars().count() < 2
             || query.starts_with('>')
             || looks_like_url(&query)
@@ -2736,6 +3028,14 @@ impl Launcher {
                 self.use_snippet(id, !admin, window, cx);
                 hide = false;
             }
+            Target::NewMemo(input) => {
+                self.add_memo_from_search(input, cx);
+                hide = false;
+            }
+            Target::Memo(id) => {
+                self.open_memos(Some(id.clone()), window, cx);
+                hide = false;
+            }
         }
         self.config.save();
         if hide && (self.mini || self.config.settings.hide_after_launch) {
@@ -2843,6 +3143,10 @@ impl Launcher {
             }
             QuickAction::Clipboard => {
                 self.open_clipboard_history(window, cx);
+                false
+            }
+            QuickAction::Memo => {
+                self.open_memos(None, window, cx);
                 false
             }
             QuickAction::Note => {

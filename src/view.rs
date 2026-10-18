@@ -2264,6 +2264,9 @@ impl Render for Launcher {
             .on_action(cx.listener(|this, _: &ClipboardHistory, window, cx| {
                 this.quick_action(QuickAction::Clipboard, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &OpenMemos, window, cx| {
+                this.quick_action(QuickAction::Memo, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 if this.dialog.is_none() {
                     this.open_settings(window, cx)
