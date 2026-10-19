@@ -156,6 +156,8 @@ pub struct Settings {
     pub text_ring: bool,
     /// …and over text copied a moment ago.
     pub text_ring_after_copy: bool,
+    /// Colour of the text ring ("#RRGGBB").
+    pub text_ring_color: String,
     /// 取色器 among the quick actions.
     pub color_picker: bool,
     /// 屏幕标尺 among the quick actions.
@@ -299,6 +301,8 @@ pub struct ThemeOverrides {
 }
 
 pub const DEFAULT_ACCENT: &str = "#EE6585";
+/// The text ring's own colour (blue-violet), so it is not mistaken for the tool ring.
+pub const DEFAULT_TEXT_RING: &str = "#7662DA";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -337,6 +341,7 @@ impl Default for Settings {
             ring_show_actions: true,
             text_ring: true,
             text_ring_after_copy: true,
+            text_ring_color: DEFAULT_TEXT_RING.into(),
             color_picker: true,
             ruler: true,
             clipboard_history: true,

@@ -8,7 +8,7 @@ use gpui::{
 use crate::{
     config::{Config, ThemeMode, Tool},
     icons::PICKER_ICONS,
-    config::DEFAULT_ACCENT,
+    config::{DEFAULT_ACCENT, DEFAULT_TEXT_RING},
     input::{InputEvent, TextInput},
     launcher::{FocusNextField, FocusPrevField, Launcher, ToolFilter},
     theme::{ACCENT_PRESETS, TINTS, Theme, parse_hex},
@@ -188,6 +188,8 @@ pub struct SettingsEditor {
     terminal: Entity<TextInput>,
     accent: Entity<TextInput>,
     _accent_subscription: Subscription,
+    text_ring_color: Entity<TextInput>,
+    _text_ring_subscription: Subscription,
     status: Option<(SharedString, bool)>,
     detected_terminal: String,
     /// Programs with a window open when Settings was opened (quick picks for exclusions).
@@ -208,7 +210,7 @@ impl Dialog {
                 e.download_url.clone(),
             ],
             Dialog::Settings(s) => match s.tab {
-                SettingsTab::General => vec![s.hotkey.clone(), s.terminal.clone()],
+                SettingsTab::General => vec![s.hotkey.clone(), s.text_ring_color.clone(), s.terminal.clone()],
                 SettingsTab::Appearance => vec![s.accent.clone()],
                 SettingsTab::Preview => Vec::new(),
                 SettingsTab::Ai => vec![s.ai_base_url.clone(), s.ai_key.clone(), s.ai_model.clone()],
@@ -1176,6 +1178,18 @@ impl Launcher {
                 }
             }
         });
+        let text_ring_color = new_input(cx, DEFAULT_TEXT_RING, &settings.text_ring_color);
+        let text_ring_subscription = cx.subscribe(&text_ring_color, |this, input, _: &InputEvent, cx| {
+            let text = input.read(cx).committed_text();
+            if parse_hex(&text).is_some() {
+                let hex = format!("#{}", text.trim().trim_start_matches('#').to_uppercase());
+                if hex != this.config.settings.text_ring_color {
+                    this.config.settings.text_ring_color = hex;
+                    this.config.save();
+                    cx.notify();
+                }
+            }
+        });
         let ai = settings.active_ai().cloned().unwrap_or_default();
         let ai_key = cx.new(|cx| {
             let mut input = TextInput::new("sk-…", cx).masked();
@@ -1199,6 +1213,8 @@ impl Launcher {
             terminal: new_input(cx, "留空则自动检测", &settings.terminal),
             accent,
             _accent_subscription: accent_subscription,
+            text_ring_color,
+            _text_ring_subscription: text_ring_subscription,
             status: None,
             detected_terminal: win::detect_terminal(),
             running: win::windowed_programs(),
@@ -2670,6 +2686,41 @@ impl Launcher {
                 .child(div().text_size(px(12.)).child(*name))
         });
 
+        // 划词圆环颜色: its own default first, then the theme colours.
+        let current_text_ring = settings.text_ring_color.to_ascii_uppercase();
+        let text_ring_swatches = std::iter::once(("蓝紫", DEFAULT_TEXT_RING)).chain(ACCENT_PRESETS.iter().copied()).enumerate().map(
+            |(ix, (name, hex))| {
+                let color = parse_hex(hex).unwrap_or(theme.accent);
+                let selected = current_text_ring == hex.to_ascii_uppercase();
+                let hex = hex.to_string();
+                div()
+                    .id(("text-ring-color", ix))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .pl(px(4.))
+                    .pr(px(9.))
+                    .h(px(28.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if selected { color } else { theme.border })
+                    .when(selected, |d| d.bg(color.opacity(0.1)))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.row_hover))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if let Some(Dialog::Settings(editor)) = this.dialog.as_ref() {
+                            let input = editor.text_ring_color.clone();
+                            let hex = hex.clone();
+                            // The input's change subscription saves it.
+                            input.update(cx, |input, cx| input.set_text(hex, cx));
+                        }
+                    }))
+                    .child(div().size(px(18.)).rounded_full().bg(color))
+                    .child(div().text_size(px(12.)).child(name))
+            },
+        )
+        .collect::<Vec<_>>();
+
         let opacity_options = [70u8, 80, 88, 95, 100].into_iter().enumerate().map(|(ix, value)| {
             let selected = settings.opacity == value;
             div()
@@ -2956,7 +3007,7 @@ impl Launcher {
                     toggle(
                         "text-ring",
                         "选中文字时弹出划词圆环",
-                        "先选中一段文字再按住 Alt：在鼠标旁弹出蓝紫色的圆环，可以翻译、解释、总结、搜索、复制",
+                        "先选中一段文字再按住 Alt：在鼠标旁弹出另一种颜色的圆环，可以翻译、解释、总结、搜索、复制",
                         settings.text_ring,
                         theme,
                     )
@@ -2980,6 +3031,34 @@ impl Launcher {
                             this.config.save();
                             cx.notify();
                         })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(div().text_size(px(13.5)).child("划词圆环颜色"))
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .text_color(theme.text_faint)
+                                                    .child("圆环和里面的图标都用这个颜色；可以填 #RRGGBB"),
+                                            ),
+                                    )
+                                    .child(self.input_box(&editor.text_ring_color, theme, window, cx).w(px(120.)).h(px(32.))),
+                            )
+                            .child(div().flex().flex_wrap().gap(px(8.)).children(text_ring_swatches)),
                     )
                 })
                 .child(

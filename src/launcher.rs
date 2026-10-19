@@ -2068,18 +2068,21 @@ impl Launcher {
                 }
             }
         }
+        let color = &self.config.settings.text_ring_color;
+        let text_color = crate::theme::parse_hex(color).unwrap_or(crate::ring::TEXT_ACCENT);
         let items = match &text {
             Some(t) => TextAction::for_text(t)
                 .into_iter()
                 .map(|a| crate::ring::RingItem {
                     id: a.key().to_string(),
                     name: a.label().into(),
-                    visual: Visual::Glyph { icon: a.icon(), tint: "purple".into() },
+                    visual: Visual::Glyph { icon: a.icon(), tint: color.clone() },
                 })
                 .collect(),
             None => self.ring_items(),
         };
         self.ring_text = text.clone();
+        let text = text.map(|t| (t, text_color));
         // Releasing Alt now would open the active app's menu bar; make it "Alt + something".
         win::send_mask_key();
         if let Some(ring) = self.ring {

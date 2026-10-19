@@ -617,7 +617,8 @@ fn edit_selection() -> Option<String> {
         let n = GetClassNameW(focus, &mut class) as usize;
         let class = String::from_utf16_lossy(&class[..n]).to_ascii_lowercase();
         let rich = class.contains("richedit");
-        if !(rich || class == "edit") {
+        // WinForms text boxes are edit controls under another name.
+        if !(rich || class == "edit" || class.starts_with("windowsforms10.edit")) {
             return None;
         }
         let send = |msg: u32, w: usize, l: isize| -> Option<usize> {

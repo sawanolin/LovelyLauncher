@@ -197,8 +197,15 @@ impl Theme {
         cx.global::<Theme>()
     }
 
-    /// (foreground, background) for a named accent color of a tool tile.
+    /// (foreground, background) for a named accent color of a tool tile, or a "#RRGGBB" one.
     pub fn tint(&self, name: &str) -> (Hsla, Hsla) {
+        if let Some(c) = name.starts_with('#').then(|| parse_hex(name)).flatten() {
+            return if self.dark {
+                (hsla(c.h, c.s, c.l.max(0.7), 1.), hsla(c.h, c.s * 0.4, 0.22, 1.))
+            } else {
+                (hsla(c.h, c.s, c.l, 1.), hsla(c.h, c.s * 0.85, 0.95, 1.))
+            };
+        }
         let (fg, light_bg, dark_bg, dark_fg): (u32, u32, u32, Option<u32>) = match name {
             "blue" => (0x3b82f6, 0xe8f0fe, 0x1f2a44, Some(0x7fb0ff)),
             "sky" => (0x0ea5e9, 0xe0f2fe, 0x13303f, Some(0x5cc8f5)),

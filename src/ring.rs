@@ -144,6 +144,8 @@ pub struct Ring {
     logo: Option<Arc<RenderImage>>,
     /// The text ring: the selected text, quoted in the middle.
     text: Option<SharedString>,
+    /// …and its colour (划词圆环颜色).
+    text_accent: Hsla,
     /// Size factor (圆环大小): the layout is in units of the standard size, times this.
     k: f32,
 }
@@ -188,12 +190,13 @@ impl Ring {
             bounce: Bounce::level(2),
             logo: None,
             text: None,
+            text_accent: TEXT_ACCENT,
             k: 1.,
         }
     }
 
     /// Pop the ring up in the corner of the monitor under the cursor.
-    /// Pop up with `items`; with `text`, as the text ring (other colour, the text in
+    /// Pop up with `items`; with `text` (and its colour), as the text ring (the text in
     /// the middle, at the pointer).
     pub fn open(
         &mut self,
@@ -202,12 +205,15 @@ impl Ring {
         bounce: u8,
         size: u8,
         at_cursor: bool,
-        text: Option<String>,
+        text: Option<(String, Hsla)>,
         cx: &mut Context<Self>,
     ) {
         self.k = size_factor(size);
         let at_cursor = at_cursor || text.is_some();
-        self.text = text.map(|t| excerpt(&t, 46).into());
+        if let Some((_, color)) = &text {
+            self.text_accent = *color;
+        }
+        self.text = text.map(|(t, _)| excerpt(&t, 46).into());
         let b = Bounce::level(bounce);
         self.bounce = b;
         let now = Instant::now();
@@ -381,8 +387,8 @@ pub fn size_factor(size: u8) -> f32 {
     }
 }
 
-/// Colour of the text ring.
-const TEXT_ACCENT: gpui::Hsla = gpui::Hsla { h: 250. / 360., s: 0.62, l: 0.62, a: 1. };
+/// Colour of the text ring when the setting can't be read (`DEFAULT_TEXT_RING`).
+pub const TEXT_ACCENT: Hsla = Hsla { h: 250. / 360., s: 0.62, l: 0.62, a: 1. };
 
 /// The start of `text` on one line, at most `max` characters.
 fn excerpt(text: &str, max: usize) -> String {
@@ -449,8 +455,8 @@ impl Render for Ring {
         let theme = Theme::get(cx).clone();
         let (sx, sy) = (s * (1. + self.squash.x), s * (1. - self.squash.x));
         let c = CENTER * k;
-        // The text ring is blue-violet, so it is not mistaken for the tool ring.
-        let accent = if self.text.is_some() { TEXT_ACCENT } else { theme.accent };
+        // The text ring has its own colour, so it is not mistaken for the tool ring.
+        let accent = if self.text.is_some() { self.text_accent } else { theme.accent };
         let mut layers: Vec<AnyElement> = Vec::new();
 
         let white = |a: f32| hsla(0., 0., 1., a);
